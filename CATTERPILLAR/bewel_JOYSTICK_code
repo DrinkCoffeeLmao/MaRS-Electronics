@@ -1,6 +1,6 @@
-//---------------------------------------------bewel joystick code with limit switches -----------------------------------------------------
 
 
+//------------------------------------------------------bewel with limit switch and encoders feedback joystick code------------------------------------------
 
 
 
@@ -24,16 +24,13 @@
 #define ENCODER2_A 39
 #define ENCODER2_B 36
 
-
-
 // === Limit Switch Pins ===
 #define LIMIT_LIFT_UP 25
 #define LIMIT_LIFT_DOWN 26
 
-
-
 // === Encoder CPR ===
 #define CPR 6500.0
+#define GEAR_RATIO 1.0
 
 // === PWM Config ===
 const int pwmFreq = 20000;
@@ -50,6 +47,7 @@ ESP32Encoder enc1, enc2;
 // === Movement variables ===
 float targetBevel = 0, targetLift = 0;
 float currentBevel = 0, currentLift = 0;
+float currentAngleL = 0, currentAngleR = 0;  // Individual encoder angles
 bool movingBevel = false, movingLift = false;
 int bevelDir = 1, liftDir = 1;
 
@@ -77,10 +75,22 @@ std_msgs__msg__Float32 msg_lift_angle;
     }                     \
   }
 
-// === Helper: Encoder angle ===
-float getAngle(ESP32Encoder &enc)
+// === Helper: Convert encoder counts to angle ===
+float getJointAngle(long counts)
 {
-    return (enc.getCount() / CPR) * 360.0;
+    return (counts / (CPR * GEAR_RATIO)) * 360.0;
+}
+
+// === Helper: Get averaged angle from both encoders ===
+float getAveragedAngle()
+{
+    long encCountL = enc1.getCount();
+    long encCountR = enc2.getCount();
+    
+    currentAngleL = fabs(getJointAngle(encCountL));
+    currentAngleR = fabs(getJointAngle(encCountR));
+    
+    return (currentAngleL + currentAngleR) / 2.0;
 }
 
 // === Stop both motors ===
@@ -113,13 +123,15 @@ void driveMotors(int pwm, bool sameDirection, int dir)
 // Bit 0 → Bevel rotate +
 // Bit 1 → Bevel rotate -
 // Bit 2 → Lift +
+// Bit 3 → Lift -
 void bevel_cmd_callback(const void *msgin)
 {
     const std_msgs__msg__Int16 *msg = (const std_msgs__msg__Int16 *)msgin;
     int cmd = msg->data;
     last_cmd_time = millis();
 
-    currentBevel = getAngle(enc1);
+    // Get current averaged angle from both encoders
+    currentBevel = getAveragedAngle();
     currentLift = currentBevel; // same motors, logical separate variable
 
     movingBevel = false;
@@ -206,34 +218,27 @@ void loop()
     // Handle ROS callbacks
     rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
 
-  // Inside the limit switch section:
-  if(!digitalRead(LIMIT_LIFT_UP) && movingLift == true && liftDir > 0)
-  {
-    enc1.clearCount();
-    enc2.clearCount();
-    stopMotors();
-    movingLift = false;
-    movingBevel = false;
-    currentBevel = 0;
-    currentLift = 0;
-    targetBevel = 0;
-    targetLift = 0;
-  }
-  else if(!digitalRead(LIMIT_LIFT_DOWN) && movingLift == true && liftDir < 0)
-  {
-    stopMotors();
-    movingLift = false;
-  }
-  else{
-    // Timeout safety stop
-    // if (millis() - last_cmd_time > 500)
-    // {
-    //     stopMotors();
-    //     movingBevel = false;
-    //     movingLift = false;
-    // }
+    // Limit switch handling
+    if(!digitalRead(LIMIT_LIFT_UP) && movingLift == true && liftDir > 0)
+    {
+        enc1.clearCount();
+        enc2.clearCount();
+        stopMotors();
+        movingLift = false;
+        movingBevel = false;
+        currentBevel = 0;
+        currentLift = 0;
+        targetBevel = 0;
+        targetLift = 0;
+    }
+    else if(!digitalRead(LIMIT_LIFT_DOWN) && movingLift == true && liftDir < 0)
+    {
+        stopMotors();
+        movingLift = false;
+    }
 
-    currentBevel = getAngle(enc1);
+    // Get current averaged angle from both encoders
+    currentBevel = getAveragedAngle();
     currentLift = currentBevel; // logical lift
 
     int pwmBevel = 0;
@@ -265,20 +270,10 @@ void loop()
     {
         stopMotors();
     }
-  }
-    // Publish encoder feedback
+  
+    // Publish encoder feedback (averaged angles)
     msg_bevel_angle.data = currentBevel;
     msg_lift_angle.data = currentLift;
     rcl_publish(&pub_bevel_angle, &msg_bevel_angle, NULL);
     rcl_publish(&pub_lift_angle, &msg_lift_angle, NULL);
-
-    //delay(10);
 }
-
-
-
-
-
-
-
-//---------------------------with limit switch
