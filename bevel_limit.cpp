@@ -1,4 +1,5 @@
-// bevel with  limit switch imu: Reset ESP 
+// bevel with  limit switch imu: Reset ESP without gripper 
+
 
 #include <Arduino.h>
 #include <ESP32Encoder.h>
