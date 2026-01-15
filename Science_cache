@@ -1,0 +1,274 @@
+//--------------------------science Cache with the joystick -----------------------------------------------------
+
+
+
+#include <Arduino.h>
+
+#include <micro_ros_platformio.h>
+#include <rcl/rcl.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <std_msgs/msg/int16.h>
+#include <std_msgs/msg/string.h>
+
+// =========================
+//  PIN DEFINITIONS
+// =========================
+
+// ---- DC MOTOR: AUGER ----
+#define AUGER_DIR 13
+#define AUGER_PWM 12
+
+// ---- DC MOTOR: LA (Linear Actuator) ----
+#define LA_DIR 25
+#define LA_PWM 26
+
+// ---- DC MOTOR: TOP ----
+#define TOP_DIR 14
+#define TOP_PWM 27
+
+// ---- LIMIT SWITCHES ----
+#define LIMIT_LA  36 
+#define LIMIT_TOP 39
+
+// ---- STEPPER: PLATE ----
+#define PLATE_STEP 32
+#define PLATE_DIR 33
+
+// =========================
+// PWM CONFIG FOR DC MOTORS
+// =========================
+const int pwmFreq = 20000;
+const int pwmRes = 8;
+
+const int chAuger = 0;
+const int chLA = 1;
+const int chTop = 2;
+
+const int fixedPWM_Auger = 200;
+const int fixedPWM_LA = 200;
+const int fixedPWM_Top = 200;
+
+// =========================
+// STEPPER CONFIG
+// =========================
+const int STEPPER_SPEED_US = 3200; // pulse speed (delayMicroseconds)
+
+// direction flags (for limit switch control)
+int moveDirLA = 0;
+int moveDirTop = 0;
+int moveDirPlate = 0; // stepper
+
+unsigned long last_cmd_time = 0;
+
+// =========================
+// micro-ROS ENTITIES
+// =========================
+rcl_node_t node;
+rclc_executor_t executor;
+rcl_allocator_t allocator;
+rclc_support_t support;
+
+rcl_subscription_t manipulator_cmd_sub;
+rcl_publisher_t debug_pub;
+
+std_msgs__msg__Int16 manipulator_cmd_msg;
+std_msgs__msg__String debug_msg;
+
+#define RCCHECK(fn)       \
+  {                       \
+    rcl_ret_t rc = fn;    \
+    if (rc != RCL_RET_OK) \
+    {                     \
+      while (1)           \
+        ;                 \
+    }                     \
+  }
+
+// =========================
+// DEBUG PUBLISHER
+// =========================
+void debug_log(const char *msg)
+{
+  debug_msg.data.data = (char *)msg;
+  debug_msg.data.size = strlen(msg);
+  debug_msg.data.capacity = strlen(msg) + 1;
+  rcl_publish(&debug_pub, &debug_msg, NULL);
+}
+
+// =========================
+// DC MOTOR DRIVE FUNCTION
+// =========================
+void motorDrive(int channel, int dirPin, int pwm)
+{
+  bool dir = pwm >= 0;
+  digitalWrite(dirPin, dir);
+  ledcWrite(channel, abs(pwm));
+}
+
+// =========================
+// LIMIT SWITCH HANDLING
+// =========================
+void handleLimitSwitches()
+{
+  // LA (stop negative direction)
+  if (!digitalRead(LIMIT_LA) && moveDirLA < 0)
+  {
+    motorDrive(chLA, LA_DIR, 0);
+    debug_log("LA LIMIT HIT");
+  }
+
+  // TOP (stop positive direction)
+  if (!digitalRead(LIMIT_TOP) && moveDirTop > 0)
+  {
+    motorDrive(chTop, TOP_DIR, 0);
+    debug_log("TOP LIMIT HIT");
+  }
+}
+
+// =========================
+// MANIPULATOR COMMAND CALLBACK
+// =========================
+void manipulator_cmd_callback(const void *msgin)
+{
+  const std_msgs__msg__Int16 *msg = (const std_msgs__msg__Int16 *)msgin;
+  int cmd = msg->data;
+  last_cmd_time = millis();
+
+  // STOP ALL
+  motorDrive(chAuger, AUGER_DIR, 0);
+  motorDrive(chLA, LA_DIR, 0);
+  motorDrive(chTop, TOP_DIR, 0);
+  moveDirLA = moveDirTop = moveDirPlate = 0;
+
+  // --- AUGER ---
+  if (cmd & (1 << 0))
+  {
+    motorDrive(chAuger, AUGER_DIR, fixedPWM_Auger);
+  }
+  if (cmd & (1 << 1))
+  {
+    motorDrive(chAuger, AUGER_DIR, -fixedPWM_Auger);
+  }
+
+  // --- LA ---
+  if (cmd & (1 << 2))
+  {
+    moveDirLA = +1;
+    motorDrive(chLA, LA_DIR, fixedPWM_LA);
+  }
+  if (cmd & (1 << 3))
+  {
+    moveDirLA = -1;
+    motorDrive(chLA, LA_DIR, -fixedPWM_LA);
+  }
+
+  // --- TOP ---
+  if (cmd & (1 << 4))
+  {
+    moveDirTop = +1;
+    motorDrive(chTop, TOP_DIR, fixedPWM_Top);
+  }
+  if (cmd & (1 << 5))
+  {
+    moveDirTop = -1;
+    motorDrive(chTop, TOP_DIR, -fixedPWM_Top);
+  }
+
+  // --- PLATE STEPPER (continuous) ---
+  if (cmd & (1 << 6))
+  {
+    moveDirPlate = +1;
+  }
+  if (cmd & (1 << 7))
+  {
+    moveDirPlate = -1;
+  }
+}
+
+// =========================
+// SETUP
+// =========================
+void setup()
+{
+  Serial.begin(115200);
+  delay(1500);
+
+  // ---- DC MOTOR PINS ----
+  pinMode(AUGER_DIR, OUTPUT);
+  pinMode(LA_DIR, OUTPUT);
+  pinMode(TOP_DIR, OUTPUT);
+
+  ledcSetup(chAuger, pwmFreq, pwmRes);
+  ledcSetup(chLA, pwmFreq, pwmRes);
+  ledcSetup(chTop, pwmFreq, pwmRes);
+
+  ledcAttachPin(AUGER_PWM, chAuger);
+  ledcAttachPin(LA_PWM, chLA);
+  ledcAttachPin(TOP_PWM, chTop);
+
+  // ---- LIMIT SWITCHES ----
+  pinMode(LIMIT_LA, INPUT_PULLUP);
+  pinMode(LIMIT_TOP, INPUT_PULLUP);
+
+  // ---- STEPPER ----
+  pinMode(PLATE_STEP, OUTPUT);
+  pinMode(PLATE_DIR, OUTPUT);
+
+  // ---- micro-ROS INIT ----
+  set_microros_serial_transports(Serial);
+  allocator = rcl_get_default_allocator();
+
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+  RCCHECK(rclc_node_init_default(&node, "manipulator_node", "", &support));
+
+  RCCHECK(rclc_publisher_init_default(
+      &debug_pub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String),
+      "manipulator_debug"));
+
+  RCCHECK(rclc_subscription_init_default(
+      &manipulator_cmd_sub, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Int16),
+      "manipulator_cmd"));
+
+  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+  RCCHECK(rclc_executor_add_subscription(
+      &executor, &manipulator_cmd_sub,
+      &manipulator_cmd_msg,
+      &manipulator_cmd_callback,
+      ON_NEW_DATA));
+
+  debug_log("Science Cache Ready (No Encoders, 1 Stepper)");
+}
+
+// =========================
+// LOOP
+// =========================
+void loop()
+{
+  rclc_executor_spin_some(&executor, RCL_MS_TO_NS(10));
+  handleLimitSwitches();
+
+  // ---- Timeout Stop ----
+  if (millis() - last_cmd_time > 500)
+  {
+    motorDrive(chAuger, AUGER_DIR, 0);
+    motorDrive(chLA, LA_DIR, 0);
+    motorDrive(chTop, TOP_DIR, 0);
+    moveDirPlate = 0;
+  }
+
+  // ---- STEPPER CONTROL (continuous) ----
+  if (moveDirPlate != 0)
+  {
+    digitalWrite(PLATE_DIR, moveDirPlate > 0);
+
+    digitalWrite(PLATE_STEP, HIGH);
+    delayMicroseconds(STEPPER_SPEED_US);
+    digitalWrite(PLATE_STEP, LOW);
+    delayMicroseconds(STEPPER_SPEED_US);
+  }
+
+  delay(50);
+}
